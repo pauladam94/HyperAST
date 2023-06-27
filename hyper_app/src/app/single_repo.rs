@@ -1,7 +1,13 @@
+use std::{
+    ops::DerefMut,
+    sync::{Arc, Mutex, RwLock},
+};
+
 use automerge::sync::SyncDoc;
+use futures_util::SinkExt;
 use poll_promise::Promise;
 
-use crate::app::{utils, API_URL};
+use crate::app::{crdt_over_ws, utils, API_URL};
 
 use self::example_scripts::EXAMPLES;
 
@@ -11,13 +17,12 @@ use egui_addon::{
     interactive_split::interactive_splitter::InteractiveSplitter,
 };
 
-// use super::code_editor_automerge::CodeEditor;
 use super::{
-    code_editor_automerge, show_repo_menu,
+    code_editor_automerge,
+    crdt_over_ws::{DocSharingState, SharedDocView},
+    show_repo_menu,
     types::{CodeEditors, Commit, Resource, SelectedConfig},
 };
-use egui_addon::code_editor::CodeEditor;
-
 mod example_scripts;
 
 const INFO_INIT: EditorInfo<&'static str> = EditorInfo {
@@ -40,24 +45,41 @@ const INFO_ACCUMULATE: EditorInfo<&'static str> = EditorInfo {
         "`p` the accumulator of the parent node."
     ),
 };
+const INFO_DESCRIPTION: EditorInfo<&'static str> = EditorInfo {
+    title: "Desc",
+    short: "describes what this script does",
+    long: concat!(
+        "TODO syntax is similar to markdown.\n",
+        "WIP rendering the markdown, there is already an egui helper for that."
+    ),
+};
 
-impl<C: From<(EditorInfo<String>, String)>> From<&example_scripts::Scripts> for CodeEditors<C> {
+// TODO allow to change user name and generate a random default
+#[cfg(target_arch = "wasm32")]
+pub(crate) const USER: &str = "web";
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const USER: &str = "native";
+
+impl<C> From<&example_scripts::Scripts> for CodeEditors<C>
+where
+    C: From<(EditorInfo<String>, String)> + egui_addon::code_editor::CodeHolder,
+{
     fn from(value: &example_scripts::Scripts) -> Self {
+        let mut description: C = (INFO_DESCRIPTION.copied(), value.description.into()).into();
+        description.set_lang("md".to_string());
         Self {
+            description, // TODO config with markdown, not js
             init: (INFO_INIT.copied(), value.init.into()).into(),
             filter: (INFO_FILTER.copied(), value.filter.into()).into(),
             accumulate: (INFO_ACCUMULATE.copied(), value.accumulate.into()).into(),
-            // auto: std::sync::Arc::new(std::sync::Mutex::new(
-            //     crate::app::code_editor_automerge::CodeEditor {
-            //         info: AUTOMERGE.copied(),
-            //         ..value.accumulate.into()
-            //     },
-            // )),
         }
     }
 }
 
-impl<C: From<(EditorInfo<String>, String)>> Default for CodeEditors<C> {
+impl<C> Default for CodeEditors<C>
+where
+    C: From<(EditorInfo<String>, String)> + egui_addon::code_editor::CodeHolder,
+{
     fn default() -> Self {
         (&example_scripts::EXAMPLES[0].scripts).into()
     }
@@ -67,14 +89,14 @@ impl<C: From<(EditorInfo<String>, String)>> Default for CodeEditors<C> {
 #[serde(default)]
 pub(super) struct ComputeConfigSingle {
     commit: Commit,
+    config: example_scripts::Config,
     len: usize,
     #[serde(skip)]
-    rt: exp::Rt,
+    rt: crdt_over_ws::Rt,
     #[serde(skip)]
-    ws: Option<exp::WsDoc>,
-    // // ws: Option<exp::Ws>,
-    // #[serde(skip)]
-    // quote: exp::Quote,
+    ws: Option<crdt_over_ws::WsDoc>,
+    #[serde(skip)]
+    doc_db: Option<crdt_over_ws::WsDocsDb>,
 }
 
 impl Default for ComputeConfigSingle {
@@ -82,13 +104,15 @@ impl Default for ComputeConfigSingle {
         let rt = Default::default();
         // let quote = Default::default();
         let ws = None;
+        let doc_db = None;
         Self {
             commit: From::from(&example_scripts::EXAMPLES[0].commit),
+            config: example_scripts::EXAMPLES[0].config,
             // commit: "4acedc53a13a727be3640fe234f7e261d2609d58".into(),
             len: example_scripts::EXAMPLES[0].commits,
             rt,
             ws,
-            // quote,
+            doc_db,
         }
     }
 }
@@ -96,12 +120,17 @@ impl Default for ComputeConfigSingle {
 pub(super) type RemoteResult =
     Promise<ehttp::Result<Resource<Result<ComputeResults, ScriptingError>>>>;
 
+type SharedCodeEditors = std::sync::Arc<Mutex<CodeEditors<code_editor_automerge::CodeEditor>>>;
+
+type ScriptingContext = super::ScriptingContext<
+    super::types::CodeEditors,
+    super::types::CodeEditors<code_editor_automerge::CodeEditor>,
+>;
+
 pub(super) fn remote_compute_single(
     ctx: &egui::Context,
     single: &mut ComputeConfigSingle,
-    code_editors: &mut std::sync::Arc<
-        std::sync::Mutex<super::types::CodeEditors<code_editor_automerge::CodeEditor>>,
-    >,
+    code_editors: &mut ScriptingContext,
 ) -> Promise<Result<Resource<Result<ComputeResults, ScriptingError>>, String>> {
     // TODO multi requests from client
     // if single.len > 1 {
@@ -120,12 +149,23 @@ pub(super) fn remote_compute_single(
         accumulate: String,
         commits: usize,
     }
-    let code_editors = code_editors.lock().unwrap();
-    let script = ScriptContent {
-        init: code_editors.init.code().to_string(),
-        filter: code_editors.filter.code().to_string(),
-        accumulate: code_editors.accumulate.code().to_string(),
-        commits: single.len,
+    let script = match &mut code_editors.current {
+        super::EditStatus::Shared(_, shared_script) | super::EditStatus::Sharing(shared_script) => {
+            let code_editors = shared_script.lock().unwrap();
+            ScriptContent {
+                init: code_editors.init.code().to_string(),
+                filter: code_editors.filter.code().to_string(),
+                accumulate: code_editors.accumulate.code().to_string(),
+                commits: single.len,
+            }
+        }
+        super::EditStatus::Local { name: _, content }
+        | super::EditStatus::Example { i: _, content } => ScriptContent {
+            init: content.init.code().to_string(),
+            filter: content.filter.code().to_string(),
+            accumulate: content.accumulate.code().to_string(),
+            commits: single.len,
+        },
     };
     drop(code_editors);
 
@@ -174,9 +214,7 @@ pub enum ScriptingError {
 pub(super) fn show_single_repo(
     ui: &mut egui::Ui,
     single: &mut ComputeConfigSingle,
-    code_editors: &mut std::sync::Arc<
-        std::sync::Mutex<super::types::CodeEditors<code_editor_automerge::CodeEditor>>,
-    >,
+    code_editors: &mut ScriptingContext,
     trigger_compute: &mut bool,
     compute_single_result: &mut Option<
         poll_promise::Promise<
@@ -184,236 +222,90 @@ pub(super) fn show_single_repo(
         >,
     >,
 ) {
-    if let Some(ws) = &mut single.ws {
+    if let Some(doc_db) = &mut single.doc_db {
         let ctx = ui.ctx().clone();
-        // let mutex = single.quote.clone();
-        let mutex = code_editors.clone();
-        let doc = ws.doc.clone();
         let rt = single.rt.clone();
-        ws.setup_atempt(
-            |sender, mut receiver| {
-                single.rt.spawn(async move {
-                    use futures_util::StreamExt;
-                    match receiver.next().await {
-                        Some(Ok(tokio_tungstenite_wasm::Message::Binary(bin))) => {
-                            let (doc, sync_state): &mut (_, _) = &mut doc.write().unwrap();
-                            let message = automerge::sync::Message::decode(&bin).unwrap();
-                            doc.sync()
-                                .receive_sync_message(sync_state, message)
-                                .unwrap();
-                            wasm_rs_dbg::dbg!(&doc);
-                            if let Ok(t) = autosurgeon::hydrate(&*doc) {
-                                let mut text = mutex.lock().unwrap();
-                                *text = t;
-                            }
-                            ctx.request_repaint();
-                        }
-                        _ => (),
-                    }
-                    while let Some(Ok(msg)) = receiver.next().await {
-                        wasm_rs_dbg::dbg!();
-                        match msg {
-                            tokio_tungstenite_wasm::Message::Text(msg) => {
-                                wasm_rs_dbg::dbg!(&msg);
-                                // let text = &mut mutex.lock().unwrap().code.text;
-                                // text.splice(text.as_str().len(), 0, msg.to_string());
-                                // text.splice(text.as_str().len(), 0, "\n");
-                            }
-                            tokio_tungstenite_wasm::Message::Binary(bin) => {
-                                wasm_rs_dbg::dbg!();
-                                let (doc, sync_state): &mut (_, _) = &mut doc.write().unwrap();
-                                // let changes = automerge::Change::from_bytes(bin).into_iter();
-                                // wasm_rs_dbg::dbg!(changes.clone().map(|x|x.decode()).collect::<Vec<_>>());
-                                // doc.apply_changes(changes)
-                                //     .unwrap();
-                                let message = automerge::sync::Message::decode(&bin).unwrap();
-                                // doc.merge(other)
-                                match doc.sync().receive_sync_message(sync_state, message) {
-                                    Ok(_) => (),
-                                    Err(e) => {
-                                        wasm_rs_dbg::dbg!(e);
-                                        // doc
-                                        // e.
-                                    }
-                                }
-                                wasm_rs_dbg::dbg!(&doc);
-                                match autosurgeon::hydrate(doc) {
-                                    Ok(t) => {
-                                        let mut text = mutex.lock().unwrap();
-                                        *text = t;
-                                    }
-                                    Err(e) => {
-                                        wasm_rs_dbg::dbg!(e);
-                                    }
-                                }
-                                ctx.request_repaint();
-
-                                wasm_rs_dbg::dbg!();
-                                let mut sender = sender.clone();
-                                if let Some(message) = doc.sync().generate_sync_message(sync_state)
-                                {
-                                    wasm_rs_dbg::dbg!();
-                                    // use automerge::sync::SyncDoc;
-                                    use futures_util::SinkExt;
-                                    let message = tokio_tungstenite_wasm::Message::Binary(
-                                        message.encode().to_vec(),
-                                    );
-                                    rt.spawn(async move {
-                                        sender.send(message).await.unwrap();
-                                    });
-                                } else {
-                                    wasm_rs_dbg::dbg!();
-                                    use futures_util::SinkExt;
-                                    let message = tokio_tungstenite_wasm::Message::Binary(vec![]);
-                                    rt.spawn(async move {
-                                        sender.send(message).await.unwrap();
-                                    });
-                                };
-                            }
-                            tokio_tungstenite_wasm::Message::Close(_) => {
-                                wasm_rs_dbg::dbg!();
-                                break;
-                            }
-                        }
-                        ctx.request_repaint();
-                    }
-                })
-            },
+        let owner = USER.to_string();
+        let data = doc_db.data.clone();
+        if let Err(err) = doc_db.setup_atempt(
+            move |sender, receiver| rt.spawn(db_update_handler(sender, receiver, owner, ctx, data)),
             &single.rt,
-        )
-        .unwrap()
-    } else {
-        single.ws = Some(exp::WsDoc::new(&single.rt, 42, ui.ctx().clone()));
-    }
-    const TIMER: u64 = 1;
-    let is_portrait = ui.available_rect_before_wrap().aspect_ratio() < 1.0;
-    if is_portrait {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::warn_if_debug_build(ui);
-            ui.horizontal_wrapped(|ui| {
-                for ex in EXAMPLES {
-                    if ui.button(ex.name).clicked() {
-                        // exp_ws::do_stuff(&single);
-                        // exp::sync_stuff(&single);
-                        single.commit = (&ex.commit).into();
-                        single.len = ex.commits;
-                        *code_editors.lock().unwrap() = (&ex.scripts).into();
+        ) {
+            log::warn!("{}", err);
+            if ui.button("try restarting sharing connection").clicked() {
+                let url = format!("ws://{}/shared-scripts-db", &API_URL[7..]);
+                *doc_db = crdt_over_ws::WsDocsDb::new(
+                    &single.rt,
+                    USER.to_string(),
+                    ui.ctx().clone(),
+                    url,
+                );
+            }
+        }
+        match &mut code_editors.current {
+            super::EditStatus::Sharing(shared_script) => {
+                let ctx = ui.ctx().clone();
+                let rt = single.rt.clone();
+                let db = doc_db;
+                let guard = &mut db.data.write().unwrap();
+                let (waiting, vec) = guard.deref_mut();
+                if let Some(i) = waiting {
+                    wasm_rs_dbg::dbg!();
+                    let i = *i;
+                    if let Some(Some(view)) = vec.get(i) {
+                        assert_eq!(view.id, i);
+                        let url = format!("ws://{}/shared-script/{}", &API_URL[7..], i);
+                        single.ws = Some(crdt_over_ws::WsDoc::new(&rt, USER.to_string(), ctx, url));
                     }
+                    code_editors.current = super::EditStatus::Shared(i, shared_script.clone());
                 }
-            });
-
-            // if egui_addon::code_editor::generic_text_edit::TextEdit::<exp::Quot>::multiline(
-            //     &mut single.quote.lock().unwrap(),
-            // )
-            // .show(ui)
-            // .response
-            // .changed()
-
-            // if let Some(response) = {
-            //     let mut qqq = code_editors.lock().unwrap();
-            //     let resp = qqq.ui(ui);
-            //     drop(qqq);
-            //     resp
-            // } {
-            //     if response.changed() {
-            //         // wasm_rs_dbg::dbg!(code_editors.auto.lock().unwrap().code.text.as_str());
-            //         if let Some(ws) = &mut single.ws {
-            //             let timer = if ws.timer != 0.0 {
-            //                 let dt = ui.input(|mem| mem.unstable_dt);
-            //                 ws.timer + dt
-            //             } else {
-            //                 0.01
-            //             };
-            //             if timer < std::time::Duration::from_secs(TIMER).as_secs_f32() {
-            //                 ws.timer = timer;
-            //                 ui.ctx()
-            //                     .request_repaint_after(std::time::Duration::from_secs_f32(
-            //                         TIMER as f32,
-            //                     ));
-            //             } else {
-            //                 ws.timer = 0.0;
-            //                 let quote: &mut CodeEditors<crate::app::code_editor_automerge::CodeEditor<
-            //                     exp::Quot,
-            //                 >> = &mut code_editors.lock().unwrap();
-            //                 ws.changed(&single.rt, quote);
-            //             }
-            //         }
-            //     } else if let Some(ws) = &mut single.ws {
-            //         if ws.timer != 0.0 {
-            //             let dt = ui.input(|mem| mem.unstable_dt);
-            //             let timer = ws.timer + dt;
-            //             if timer < std::time::Duration::from_secs(TIMER).as_secs_f32() {
-            //                 ws.timer = timer;
-            //                 ui.ctx()
-            //                     .request_repaint_after(std::time::Duration::from_secs_f32(
-            //                         TIMER as f32,
-            //                     ));
-            //             } else {
-            //                 ws.timer = 0.0;
-            //                 let quote: &mut CodeEditors<crate::app::code_editor_automerge::CodeEditor<
-            //                     exp::Quot,
-            //                 >> = &mut code_editors.lock().unwrap();
-            //                 ws.changed(&single.rt, quote);
-            //             }
-            //         }
-            //     }
-            // }
-            // ui.label(single.quote.lock().unwrap().text.as_str());
-            let resps = {
-                let mut ce = code_editors.lock().unwrap();
-                [ce.init.ui(ui), ce.filter.ui(ui), ce.accumulate.ui(ui)]
-            };
-            if resps
-                .iter()
-                .any(|x| x.as_ref().map_or(false, |x| x.changed()))
-            {
-                // wasm_rs_dbg::dbg!(code_editors.lock().unwrap().code.text.as_str());
+            }
+            super::EditStatus::Shared(_, shared_script) => {
                 if let Some(ws) = &mut single.ws {
-                    let timer = if ws.timer != 0.0 {
-                        let dt = ui.input(|mem| mem.unstable_dt);
-                        ws.timer + dt
-                    } else {
-                        0.01
-                    };
-                    if timer < std::time::Duration::from_secs(TIMER).as_secs_f32() {
-                        ws.timer = timer;
-                        ui.ctx()
-                            .request_repaint_after(std::time::Duration::from_secs_f32(
-                                TIMER as f32,
-                            ));
-                    } else {
-                        ws.timer = 0.0;
-                        let quote: &mut CodeEditors<
-                            crate::app::code_editor_automerge::CodeEditor<exp::Quot>,
-                        > = &mut code_editors.lock().unwrap();
-                        ws.changed(&single.rt, quote);
-                    }
-                }
-            } else if let Some(ws) = &mut single.ws {
-                if ws.timer != 0.0 {
-                    let dt = ui.input(|mem| mem.unstable_dt);
-                    let timer = ws.timer + dt;
-                    if timer < std::time::Duration::from_secs(TIMER).as_secs_f32() {
-                        ws.timer = timer;
-                        ui.ctx()
-                            .request_repaint_after(std::time::Duration::from_secs_f32(
-                                TIMER as f32,
-                            ));
-                    } else {
-                        ws.timer = 0.0;
-                        let quote: &mut CodeEditors<
-                            crate::app::code_editor_automerge::CodeEditor<exp::Quot>,
-                        > = &mut code_editors.lock().unwrap();
-                        ws.changed(&single.rt, quote);
+                    wasm_rs_dbg::dbg!();
+                    let ctx = ui.ctx().clone();
+                    let doc = ws.data.clone();
+                    let rt = single.rt.clone();
+                    let code_editors = shared_script.clone();
+                    if let Err(e) = ws.setup_atempt(
+                        |sender, receiver| {
+                            single.rt.spawn(update_handler(
+                                receiver,
+                                sender,
+                                doc,
+                                ctx,
+                                rt,
+                                code_editors,
+                            ))
+                        },
+                        &single.rt,
+                    ) {
+                        log::error!("{}", e);
                     }
                 }
             }
-            ui.horizontal(|ui| {
-                if ui.add(egui::Button::new("Compute")).clicked() {
-                    *trigger_compute |= true;
-                };
-                show_short_result(&*compute_single_result, ui);
-            });
+            _ => (),
+        }
+    } else {
+        let url = format!("ws://{}/shared-scripts-db", &API_URL[7..]);
+        single.doc_db = Some(crdt_over_ws::WsDocsDb::new(
+            &single.rt,
+            USER.to_string(),
+            ui.ctx().clone(),
+            url,
+        ));
+    }
+    let is_portrait = ui.available_rect_before_wrap().aspect_ratio() < 1.0;
+    if is_portrait {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            show_scripts_edition(ui, code_editors, single);
+            handle_interactions(
+                ui,
+                code_editors,
+                compute_single_result,
+                single,
+                trigger_compute,
+            );
             show_long_result(&*compute_single_result, ui);
         });
     } else {
@@ -421,132 +313,562 @@ pub(super) fn show_single_repo(
             .ratio(0.7)
             .show(ui, |ui1, ui2| {
                 ui1.push_id(ui1.id().with("input"), |ui| {
-                    egui::warn_if_debug_build(ui);
-                    ui.horizontal_wrapped(|ui| {
-                        for ex in EXAMPLES {
-                            if ui.button(ex.name).clicked() {
-                                single.commit = (&ex.commit).into();
-                                single.len = ex.commits;
-                                *code_editors.lock().unwrap() = (&ex.scripts).into();
-                            }
-                        }
-                    });
-                    // let code_editor = &mut code_editors.lock().unwrap();
-                    // if let Some(response) = code_editor.ui(ui) {
-                    //     if response.changed() {
-                    //         // wasm_rs_dbg::dbg!(code_editor.code.text.as_str());
-                    //         if let Some(ws) = &mut single.ws {
-                    //             let timer = if ws.timer != 0.0 {
-                    //                 let dt = ui.input(|mem| mem.unstable_dt);
-                    //                 ws.timer + dt
-                    //             } else {
-                    //                 0.01
-                    //             };
-                    //             if timer < std::time::Duration::from_secs(TIMER).as_secs_f32() {
-                    //                 ws.timer = timer;
-                    //                 ui.ctx().request_repaint_after(
-                    //                     std::time::Duration::from_secs_f32(TIMER as f32),
-                    //                 );
-                    //             } else {
-                    //                 ws.timer = 0.0;
-                    //                 let quote: &mut crate::app::code_editor_automerge::CodeEditor<
-                    //                     exp::Quot,
-                    //                 > = code_editor;
-                    //                 ws.changed(&single.rt, quote);
-                    //             }
-                    //         }
-                    //     } else if let Some(ws) = &mut single.ws {
-                    //         if ws.timer != 0.0 {
-                    //             let dt = ui.input(|mem| mem.unstable_dt);
-                    //             let timer = ws.timer + dt;
-                    //             if timer < std::time::Duration::from_secs(TIMER).as_secs_f32() {
-                    //                 ws.timer = timer;
-                    //                 ui.ctx().request_repaint_after(
-                    //                     std::time::Duration::from_secs_f32(TIMER as f32),
-                    //                 );
-                    //             } else {
-                    //                 ws.timer = 0.0;
-                    //                 let quote: &mut crate::app::code_editor_automerge::CodeEditor<
-                    //                     exp::Quot,
-                    //                 > = code_editor;
-                    //                 ws.changed(&single.rt, quote);
-                    //             }
-                    //         }
-                    //     }
-                    // }
-                    // code_editors.init.ui(ui);
-                    // code_editors.filter.ui(ui);
-                    // code_editors.accumulate.ui(ui);
-                    let resps = {
-                        let mut ce = code_editors.lock().unwrap();
-                        [ce.init.ui(ui), ce.filter.ui(ui), ce.accumulate.ui(ui)]
-                    };
-                    if resps
-                        .iter()
-                        .any(|x| x.as_ref().map_or(false, |x| x.changed()))
-                    {
-                        // wasm_rs_dbg::dbg!(code_editors.lock().unwrap().code.text.as_str());
-                        if let Some(ws) = &mut single.ws {
-                            let timer = if ws.timer != 0.0 {
-                                let dt = ui.input(|mem| mem.unstable_dt);
-                                ws.timer + dt
-                            } else {
-                                0.01
-                            };
-                            if timer < std::time::Duration::from_secs(TIMER).as_secs_f32() {
-                                ws.timer = timer;
-                                ui.ctx()
-                                    .request_repaint_after(std::time::Duration::from_secs_f32(
-                                        TIMER as f32,
-                                    ));
-                            } else {
-                                ws.timer = 0.0;
-                                let quote: &mut CodeEditors<
-                                    crate::app::code_editor_automerge::CodeEditor<exp::Quot>,
-                                > = &mut code_editors.lock().unwrap();
-                                ws.changed(&single.rt, quote);
-                            }
-                        }
-                    } else if let Some(ws) = &mut single.ws {
-                        if ws.timer != 0.0 {
-                            let dt = ui.input(|mem| mem.unstable_dt);
-                            let timer = ws.timer + dt;
-                            if timer < std::time::Duration::from_secs(TIMER).as_secs_f32() {
-                                ws.timer = timer;
-                                ui.ctx()
-                                    .request_repaint_after(std::time::Duration::from_secs_f32(
-                                        TIMER as f32,
-                                    ));
-                            } else {
-                                ws.timer = 0.0;
-                                let quote: &mut CodeEditors<
-                                    crate::app::code_editor_automerge::CodeEditor<exp::Quot>,
-                                > = &mut code_editors.lock().unwrap();
-                                ws.changed(&single.rt, quote);
-                            }
-                        }
-                    }
+                    show_scripts_edition(ui, code_editors, single);
                 });
                 let ui = ui2;
-                // ui.painter().debug_rect(ui.max_rect(), egui::Color32::RED, "text");
-                // ui.painter().debug_rect(ui.clip_rect(), egui::Color32::GREEN, "text");
-                // ui.painter().debug_rect(ui.available_rect_before_wrap(), egui::Color32::BLUE, "text");
-                // ui.set_clip_rect(ui.available_rect_before_wrap());
-                // ui.set_max_size(ui.available_size_before_wrap());
-                ui.horizontal(|ui| {
-                    if ui.add(egui::Button::new("Compute")).clicked() {
-                        *trigger_compute |= true;
-                    };
-                    show_short_result(&*compute_single_result, ui);
-                });
+                handle_interactions(
+                    ui,
+                    code_editors,
+                    compute_single_result,
+                    single,
+                    trigger_compute,
+                );
                 show_long_result(&*compute_single_result, ui);
             });
     }
 }
 
+fn handle_interactions(
+    ui: &mut egui::Ui,
+    code_editors: &mut super::ScriptingContext<
+        CodeEditors,
+        CodeEditors<code_editor_automerge::CodeEditor>,
+    >,
+    compute_single_result: &mut Option<
+        Promise<Result<Resource<Result<ComputeResults, ScriptingError>>, String>>,
+    >,
+    single: &mut ComputeConfigSingle,
+    trigger_compute: &mut bool,
+) {
+    let interaction = show_interactions(ui, code_editors, &single.doc_db, compute_single_result);
+    if interaction.share_button.map_or(false, |x| x.clicked()) {
+        let (name, content) = interaction.editor.unwrap();
+        let content = content.clone().to_shared();
+        let content = Arc::new(Mutex::new(content));
+        let name = name.to_string();
+        code_editors.current = super::EditStatus::Sharing(content.clone());
+        let mut content = content.lock().unwrap();
+        let db = &mut single.doc_db.as_mut().unwrap();
+        db.create_doc_atempt(&single.rt, name, content.deref_mut());
+    } else if interaction.save_button.map_or(false, |x| x.clicked()) {
+        let (name, content) = interaction.editor.unwrap();
+        log::warn!("saving script: {:#?}", content.clone());
+        let name = name.to_string();
+        let content = content.clone();
+        code_editors
+            .local_scripts
+            .insert(name.to_string(), content.clone());
+        code_editors.current = super::EditStatus::Local { name, content };
+    } else if interaction.compute_button.clicked() {
+        *trigger_compute |= true;
+    }
+}
+
+fn show_interactions<'a>(
+    ui: &mut egui::Ui,
+    code_editors: &'a mut ScriptingContext,
+    docs_db: &Option<crdt_over_ws::WsDocsDb>,
+    compute_single_result: &mut Option<
+        poll_promise::Promise<
+            Result<super::types::Resource<Result<ComputeResults, ScriptingError>>, String>,
+        >,
+    >,
+) -> InteractionResp<'a> {
+    let mut save_button = None;
+    let mut share_button = None;
+    let mut editor: Option<(&str, &CodeEditors)> = None;
+    ui.horizontal(|ui| match &mut code_editors.current {
+        super::EditStatus::Example { i, content } => {
+            save_button = Some(ui.add(egui::Button::new("Save Script")));
+            let name = &EXAMPLES[*i].name;
+            editor = Some((name, &*content));
+        }
+        super::EditStatus::Local { name, content } => {
+            if let Some(doc_db) = docs_db {
+                if doc_db.is_connected() {
+                    share_button = Some(ui.add(egui::Button::new("Share Script")));
+                }
+            }
+            save_button = Some(ui.add(egui::Button::new("Save Script")));
+            ui.text_edit_singleline(name);
+            editor = Some((name, &*content));
+        }
+        _ => (),
+    });
+    let compute_button = ui
+        .horizontal(|ui| {
+            let compute_button = ui.add(egui::Button::new("Compute"));
+            show_short_result(&*compute_single_result, ui);
+            compute_button
+        })
+        .inner;
+
+    InteractionResp {
+        compute_button,
+        editor,
+        save_button,
+        share_button,
+    }
+}
+
+struct InteractionResp<'a> {
+    compute_button: egui::Response,
+    save_button: Option<egui::Response>,
+    share_button: Option<egui::Response>,
+    editor: Option<(&'a str, &'a CodeEditors)>,
+}
+
+fn show_scripts_edition(
+    ui: &mut egui::Ui,
+    scripting_context: &mut ScriptingContext,
+    single: &mut ComputeConfigSingle,
+) {
+    show_available_stuff(ui, single, scripting_context);
+    match &mut scripting_context.current {
+        super::EditStatus::Example {
+            i: _,
+            content: code_editors,
+        } => {
+            show_local_code_edition(ui, code_editors, single);
+        }
+        super::EditStatus::Local {
+            name: _,
+            content: code_editors,
+        } => {
+            show_local_code_edition(ui, code_editors, single);
+        }
+        super::EditStatus::Sharing(code_editors) => {
+            show_shared_code_edition(ui, code_editors, single);
+        }
+        super::EditStatus::Shared(_, code_editors) => {
+            show_shared_code_edition(ui, code_editors, single);
+        }
+    }
+}
+
+fn show_shared_code_edition(
+    ui: &mut egui::Ui,
+    code_editors: &mut SharedCodeEditors,
+    single: &mut ComputeConfigSingle,
+) {
+    let resps = {
+        let mut ce = code_editors.lock().unwrap();
+        [
+            ce.description.ui(ui),
+            ce.init.ui(ui),
+            ce.filter.ui(ui),
+            ce.accumulate.ui(ui),
+        ]
+    };
+
+    let Some(ws) = &mut single.ws else {
+        return;
+    };
+    if resps.iter().filter_map(|x| x.as_ref()).any(|x| x.changed()) {
+        let timer = if ws.timer != 0.0 {
+            let dt = ui.input(|mem| mem.unstable_dt);
+            ws.timer + dt
+        } else {
+            0.01
+        };
+        let rt = &single.rt;
+        timed_updater(timer, ws, ui, code_editors, rt);
+    } else if ws.timer != 0.0 {
+        let dt = ui.input(|mem| mem.unstable_dt);
+        let timer = ws.timer + dt;
+        let rt = &single.rt;
+        timed_updater(timer, ws, ui, code_editors, rt);
+    }
+}
+
+fn show_local_code_edition(
+    ui: &mut egui::Ui,
+    code_editors: &mut CodeEditors,
+    _single: &mut ComputeConfigSingle,
+) {
+    let _resps = {
+        let ce = code_editors;
+        [
+            ce.description.ui(ui),
+            ce.init.ui(ui),
+            ce.filter.ui(ui),
+            ce.accumulate.ui(ui),
+        ]
+    };
+}
+
+fn show_available_stuff(
+    ui: &mut egui::Ui,
+    single: &mut ComputeConfigSingle,
+    scripting_context: &mut ScriptingContext,
+) {
+    egui::warn_if_debug_build(ui);
+    egui::CollapsingHeader::new("Examples")
+        .default_open(true)
+        .show(ui, |ui| show_examples(ui, single, scripting_context));
+    if !scripting_context.local_scripts.is_empty() {
+        egui::CollapsingHeader::new("Local Scripts")
+            .default_open(true)
+            .show(ui, |ui| show_locals(ui, single, scripting_context));
+    }
+    if let Some(doc_db) = &single.doc_db {
+        let names: Vec<_> = doc_db
+            .data
+            .read()
+            .unwrap()
+            .1
+            .iter()
+            .filter_map(|d| d.as_ref())
+            .map(|x| (format!("{}/{}", x.owner, x.name), x.id))
+            .collect();
+        if !names.is_empty() {
+            egui::CollapsingHeader::new("Shared Scripts")
+                .default_open(true)
+                .show(ui, |ui| show_shared(ui, single, scripting_context, names));
+        }
+    }
+}
+
+fn show_examples(
+    ui: &mut egui::Ui,
+    single: &mut ComputeConfigSingle,
+    scripting_context: &mut ScriptingContext,
+) {
+    ui.horizontal_wrapped(|ui| {
+        let mut j = 0;
+        for ex in EXAMPLES {
+            let mut text = egui::RichText::new(ex.name);
+            if let super::EditStatus::Example { i, .. } = &scripting_context.current {
+                if &j == i {
+                    text = text.strong();
+                }
+            }
+            let button = &ui.button(text);
+            if button.clicked() {
+                single.commit = (&ex.commit).into();
+                single.config = ex.config;
+                single.len = ex.commits;
+                scripting_context.current = super::EditStatus::Example {
+                    i: j,
+                    content: (&ex.scripts).into(),
+                };
+            }
+            if button.hovered() {
+                egui::show_tooltip(ui.ctx(), button.id.with("tooltip"), |ui| {
+                    let desc = ex.scripts.description;
+                    egui_demo_lib::easy_mark::easy_mark(ui, desc);
+                });
+            }
+            j += 1;
+        }
+    });
+}
+
+fn show_locals(
+    ui: &mut egui::Ui,
+    single: &mut ComputeConfigSingle,
+    scripting_context: &mut ScriptingContext,
+) {
+    ui.horizontal_wrapped(|ui| {
+        // let mut n = None;
+        for (name, s) in &scripting_context.local_scripts {
+            let mut text = egui::RichText::new(name);
+            if let super::EditStatus::Local {
+                name: n,
+                content: _,
+            } = &scripting_context.current
+            {
+                if name == n {
+                    text = text.strong();
+                }
+            }
+            let button = ui.button(text);
+            if button.clicked() {
+                // res = Some(ex);
+                scripting_context.current = super::EditStatus::Local {
+                    name: name.clone(),
+                    content: s.clone(),
+                };
+            }
+            if button.hovered() {
+                egui::show_tooltip(ui.ctx(), button.id.with("tooltip"), |ui| {
+                    let desc = s.description.code();
+                    egui_demo_lib::easy_mark::easy_mark(ui, desc);
+                });
+            }
+            button.context_menu(|ui| {
+                if ui.button("share").clicked() {
+                    let content = s.clone().to_shared();
+                    let content = Arc::new(Mutex::new(content));
+                    scripting_context.current =
+                        super::EditStatus::Shared(usize::MAX, content.clone());
+                    let mut content = content.lock().unwrap();
+                    single.doc_db.as_mut().unwrap().create_doc_atempt(
+                        &single.rt,
+                        name.to_string(),
+                        content.deref_mut(),
+                    );
+                }
+                // let rename_button = &ui.button("rename");
+                // if rename_button.clicked() {
+                //     let popup_id = ui.make_persistent_id("rename popup");
+                //     ui.memory_mut(|mem| mem.open_popup(popup_id));
+                //     let below = egui::AboveOrBelow::Below;
+                //     egui::popup::popup_above_or_below_widget(ui, popup_id, &rename_button, below, |ui| {
+                //         let mut new = name.clone();
+                //         if ui.text_edit_singleline(&mut new).lost_focus() && name != &new {
+                //             n = Some((name.clone(),new));
+                //         }
+                //         if ui.button("abort rename").clicked() {
+                //             ui.memory_mut(|mem| mem.close_popup());
+                //         }
+                //     });
+                // }
+                // if ui.button("fork").clicked() {
+                // }
+                if ui.button("close menu").clicked() {
+                    ui.close_menu()
+                }
+            });
+        }
+        // if let Some((old,new)) = n {
+        //     let value = scripting_context.local_scripts.remove(&old).unwrap();
+        //     scripting_context.local_scripts.insert(new, value);
+        // };
+    });
+}
+
+fn show_shared(
+    ui: &mut egui::Ui,
+    single: &mut ComputeConfigSingle,
+    scripting_context: &mut ScriptingContext,
+    names: Vec<(String, usize)>,
+) {
+    let mut r = None;
+    ui.horizontal_wrapped(|ui| {
+        for (name, i) in names.iter() {
+            let mut text = egui::RichText::new(name);
+            if let super::EditStatus::Shared(j, _) = &scripting_context.current {
+                if j == i {
+                    text = text.strong();
+                }
+            }
+            if ui.button(text).clicked() {
+                r = Some(i);
+            }
+        }
+    });
+    if let Some(i) = r {
+        let code_editors: Arc<Mutex<CodeEditors<code_editor_automerge::CodeEditor>>> =
+            Default::default();
+        scripting_context.current = super::EditStatus::Shared(*i, code_editors.clone());
+        let doc_db = single.doc_db.as_ref().unwrap();
+        let doc_views = doc_db.data.write().unwrap();
+        let id = doc_views.1.get(*i).unwrap().as_ref().unwrap().id;
+        if let Some(ws) = &mut single.ws {
+            let ctx = ui.ctx().clone();
+            let rt = single.rt.clone();
+            let url = format!("ws://{}/shared-script/{}", &API_URL[7..], id);
+            *ws = crdt_over_ws::WsDoc::new(&rt, USER.to_string(), ctx, url)
+        }
+    }
+}
+fn timed_updater(
+    timer: f32,
+    ws: &mut crdt_over_ws::WsDoc,
+    ui: &mut egui::Ui,
+    code_editors: &mut SharedCodeEditors,
+    rt: &crdt_over_ws::Rt,
+) {
+    const TIMER: u64 = 1;
+    if timer < std::time::Duration::from_secs(TIMER).as_secs_f32() {
+        ws.timer = timer;
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs_f32(TIMER as f32));
+    } else {
+        ws.timer = 0.0;
+        let quote: &mut CodeEditors<
+            crate::app::code_editor_automerge::CodeEditor<crdt_over_ws::Quote>,
+        > = &mut code_editors.lock().unwrap();
+        ws.changed(rt, quote);
+    }
+}
+
+async fn update_handler(
+    mut receiver: futures_util::stream::SplitStream<tokio_tungstenite_wasm::WebSocketStream>,
+    mut sender: futures::channel::mpsc::Sender<tokio_tungstenite_wasm::Message>,
+    doc: std::sync::Arc<std::sync::RwLock<DocSharingState>>,
+    ctx: egui::Context,
+    rt: crdt_over_ws::Rt,
+    code_editors: SharedCodeEditors,
+) {
+    use futures_util::StreamExt;
+    #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
+    enum DbMsgToServer {
+        Create { name: String },
+        User { name: String },
+    }
+    let owner = USER.to_string();
+    sender
+        .send(tokio_tungstenite_wasm::Message::Text(
+            serde_json::to_string(&DbMsgToServer::User { name: owner }).unwrap(),
+        ))
+        .await
+        .unwrap();
+    match receiver.next().await {
+        Some(Ok(tokio_tungstenite_wasm::Message::Binary(bin))) => {
+            let (doc, sync_state): &mut (_, _) = &mut doc.write().unwrap();
+            let message = automerge::sync::Message::decode(&bin).unwrap();
+            doc.sync()
+                .receive_sync_message(sync_state, message)
+                .unwrap();
+            wasm_rs_dbg::dbg!(&doc);
+            if let Ok(t) = autosurgeon::hydrate(&*doc) {
+                let mut text = code_editors.lock().unwrap();
+                *text = t;
+            }
+            ctx.request_repaint();
+        }
+        _ => (),
+    }
+    while let Some(Ok(msg)) = receiver.next().await {
+        wasm_rs_dbg::dbg!();
+        match msg {
+            tokio_tungstenite_wasm::Message::Text(msg) => {
+                wasm_rs_dbg::dbg!(&msg);
+            }
+            tokio_tungstenite_wasm::Message::Binary(bin) => {
+                wasm_rs_dbg::dbg!();
+                let (doc, sync_state): &mut (_, _) = &mut doc.write().unwrap();
+                let message = automerge::sync::Message::decode(&bin).unwrap();
+                // doc.merge(other)
+                match doc.sync().receive_sync_message(sync_state, message) {
+                    Ok(_) => (),
+                    Err(e) => {
+                        wasm_rs_dbg::dbg!(e);
+                    }
+                }
+                match autosurgeon::hydrate(doc) {
+                    Ok(t) => {
+                        let mut text = code_editors.lock().unwrap();
+                        *text = t;
+                    }
+                    Err(e) => {
+                        wasm_rs_dbg::dbg!(e);
+                    }
+                }
+                ctx.request_repaint();
+
+                wasm_rs_dbg::dbg!();
+                let mut sender = sender.clone();
+                if let Some(message) = doc.sync().generate_sync_message(sync_state) {
+                    wasm_rs_dbg::dbg!();
+                    use futures_util::SinkExt;
+                    let message =
+                        tokio_tungstenite_wasm::Message::Binary(message.encode().to_vec());
+                    rt.spawn(async move {
+                        sender.send(message).await.unwrap();
+                    });
+                } else {
+                    wasm_rs_dbg::dbg!();
+                    use futures_util::SinkExt;
+                    let message = tokio_tungstenite_wasm::Message::Binary(vec![]);
+                    rt.spawn(async move {
+                        sender.send(message).await.unwrap();
+                    });
+                };
+            }
+            tokio_tungstenite_wasm::Message::Close(_) => {
+                wasm_rs_dbg::dbg!();
+                break;
+            }
+        }
+    }
+}
+
+async fn db_update_handler(
+    mut sender: futures::channel::mpsc::Sender<tokio_tungstenite_wasm::Message>,
+    mut receiver: futures_util::stream::SplitStream<tokio_tungstenite_wasm::WebSocketStream>,
+    owner: String,
+    ctx: egui::Context,
+    data: Arc<RwLock<(Option<usize>, Vec<Option<SharedDocView>>)>>,
+) {
+    use futures_util::{Future, SinkExt, StreamExt};
+    use serde::{Deserialize, Serialize};
+    type User = String;
+
+    #[derive(Deserialize, Serialize, Debug, Clone)]
+    enum DbMsgToServer {
+        Create { name: String },
+        User { name: String },
+    }
+    {
+        wasm_rs_dbg::dbg!();
+        let name = owner.clone();
+        let msg = DbMsgToServer::User { name };
+        let msg = serde_json::to_string(&msg).unwrap();
+        let msg = tokio_tungstenite_wasm::Message::Text(msg);
+        sender.send(msg).await.unwrap();
+        wasm_rs_dbg::dbg!();
+    }
+    while let Some(Ok(msg)) = receiver.next().await {
+        wasm_rs_dbg::dbg!();
+        match msg {
+            tokio_tungstenite_wasm::Message::Text(msg) => {
+                wasm_rs_dbg::dbg!(&msg);
+
+                #[derive(Deserialize, Serialize, Debug, Clone)]
+                enum DbMsgFromServer {
+                    Add(SharedDocView),
+                    AddWriter(usize, User),
+                    RmWriter(usize, User),
+                    // Rename(usize, String),
+                    Reset { all: Vec<SharedDocView> },
+                }
+                let msg = serde_json::from_str(&msg).unwrap();
+
+                match msg {
+                    DbMsgFromServer::Add(x) => {
+                        let b = x.owner == owner;
+                        let guard = &mut data.write().unwrap();
+                        let (waiting, vec) = guard.deref_mut();
+                        let id = x.id;
+                        vec.resize(id + 1, None);
+                        vec[id] = Some(x);
+                        if b {
+                            *waiting = Some(id);
+                        }
+                        ctx.request_repaint();
+                    }
+                    DbMsgFromServer::AddWriter(_, _) => todo!(),
+                    DbMsgFromServer::RmWriter(_, _) => todo!(),
+                    DbMsgFromServer::Reset { all } => {
+                        let guard = &mut data.write().unwrap();
+                        let (_, vec) = guard.deref_mut();
+                        *vec = vec![];
+                        for x in all {
+                            let id = x.id;
+                            vec.resize(id + 1, None);
+                            vec[id] = Some(x);
+                        }
+                        ctx.request_repaint();
+                    }
+                }
+            }
+            tokio_tungstenite_wasm::Message::Binary(bin) => {
+                wasm_rs_dbg::dbg!();
+            }
+            tokio_tungstenite_wasm::Message::Close(_) => {
+                wasm_rs_dbg::dbg!();
+                break;
+            }
+        }
+    }
+}
+
 impl Resource<Result<ComputeResults, ScriptingError>> {
     pub(super) fn from_response(
-        ctx: &egui::Context,
+        _ctx: &egui::Context,
         response: ehttp::Response,
     ) -> Result<Self, String> {
         wasm_rs_dbg::dbg!(&response);
@@ -621,6 +943,14 @@ pub(super) fn show_single_repo_menu(
             );
             // show_wip(ui, Some("only process one commit"));
         });
+        let mut selected = &mut single.config;
+        egui::ComboBox::from_label("Repo Config")
+            .selected_text(format!("{:?}", selected))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(selected, example_scripts::Config::Any, "Any");
+                ui.selectable_value(selected, example_scripts::Config::MavenJava, "Java");
+                ui.selectable_value(selected, example_scripts::Config::MakeCpp, "Cpp");
+            });
     };
 
     radio_collapsing(ui, id, title, selected, &wanted, add_body);
@@ -787,14 +1117,13 @@ fn show_long_result_list(content: &ComputeResults, ui: &mut egui::Ui) {
 
 fn show_long_result_table(content: &ComputeResults, ui: &mut egui::Ui) {
     // header
-    let header = content
-        .results
-        .iter()
-        .find(|x| x.is_ok())
-        .as_ref()
-        .unwrap()
-        .as_ref()
-        .unwrap();
+    let header = content.results.iter().find(|x| x.is_ok());
+    let Some(header) = header
+        .as_ref() else {
+            wasm_rs_dbg::dbg!("issue with header");
+            return;
+        };
+    let header = header.as_ref().unwrap();
     use egui_extras::{Column, TableBuilder};
     TableBuilder::new(ui)
         .striped(true)
@@ -930,808 +1259,6 @@ impl std::fmt::Display for SecFmt {
         } else {
             write!(f, "{} {}", t, n)
         }
-    }
-}
-
-mod exp_crdt {
-
-    #[test]
-    fn f() {
-        use automerge::ActorId;
-        use autosurgeon::{hydrate, reconcile, Doc, Hydrate, Reconcile, Text};
-        #[derive(Debug, Clone, Reconcile, Hydrate, PartialEq)]
-        struct Contact {
-            name: String,
-            address: Address,
-        }
-        #[derive(Debug, Clone, Reconcile, Hydrate, PartialEq)]
-        struct Address {
-            line_one: String,
-            line_two: Option<String>,
-            city: String,
-            postcode: String,
-        }
-        let mut contact = Contact {
-            name: "Sherlock Holmes".to_string(),
-            address: Address {
-                line_one: "221B Baker St".to_string(),
-                line_two: None,
-                city: "London".to_string(),
-                postcode: "42".to_string(),
-            },
-        };
-
-        let mut doc = automerge::AutoCommit::new();
-        reconcile(&mut doc, &contact).unwrap();
-
-        let contact2: Contact = hydrate(&doc).unwrap();
-        assert_eq!(contact, contact2);
-
-        // Fork and make changes
-        let mut doc2 = doc.fork().with_actor(automerge::ActorId::random());
-        let mut contact2: Contact = hydrate(&doc2).unwrap();
-        contact2.name = "Dangermouse".to_string();
-        reconcile(&mut doc2, &contact2).unwrap();
-
-        // Concurrently on doc1
-        contact.address.line_one = "221C Baker St".to_string();
-        reconcile(&mut doc, &contact).unwrap();
-
-        // Now merge the documents
-        doc.merge(&mut doc2).unwrap();
-
-        let merged: Contact = hydrate(&doc).unwrap();
-        assert_eq!(
-            merged,
-            Contact {
-                name: "Dangermouse".to_string(), // This was updated in the first doc
-                address: Address {
-                    line_one: "221C Baker St".to_string(), // This was concurrently updated in doc2
-                    line_two: None,
-                    city: "London".to_string(),
-                    postcode: "42".to_string(),
-                }
-            }
-        )
-    }
-
-    #[test]
-    fn g() {
-        use automerge::ActorId;
-        use autosurgeon::{hydrate, reconcile, Hydrate, Reconcile, Text};
-        #[derive(Default, Debug, Reconcile, Hydrate)]
-        pub(crate) struct Quote {
-            pub(crate) text: Text,
-        }
-        let mut doc = automerge::AutoCommit::new();
-        let quote = Quote {
-            text: "glimmers".into(),
-        };
-        reconcile(&mut doc, &quote).unwrap();
-
-        // Fork and make changes to the text
-        let mut doc2 = doc.fork().with_actor(ActorId::random());
-        let heads = doc2.get_heads();
-        let mut quote2: Quote = hydrate(&doc2).unwrap();
-        quote2.text.splice(0, 0, "All that ");
-        let end_index = quote2.text.as_str().char_indices().last().unwrap().0;
-        quote2.text.splice(end_index + 1, 0, " is not gold");
-        reconcile(&mut doc2, &quote2).unwrap();
-        dbg!(doc2.get_changes(&heads).unwrap());
-        automerge::Change::try_from(
-            doc2.get_changes(&heads)
-                .unwrap()
-                .get(0)
-                .unwrap()
-                .raw_bytes(),
-        )
-        .unwrap();
-
-        // Concurrently modify the text in the original doc
-        let mut quote: Quote = hydrate(&doc).unwrap();
-        let m_index = quote.text.as_str().char_indices().nth(3).unwrap().0;
-        quote.text.splice(m_index, 2, "tt");
-        reconcile(&mut doc, quote).unwrap();
-
-        // Merge the changes
-        doc.merge(&mut doc2).unwrap();
-
-        let quote: Quote = hydrate(&doc).unwrap();
-        assert_eq!(quote.text.as_str(), "All that glitters is not gold");
-    }
-
-    #[test]
-    fn h() {
-        use automerge::transaction::CommitOptions;
-        use automerge::transaction::Transactable;
-        use automerge::AutomergeError;
-        use automerge::ObjType;
-        use automerge::{Automerge, ReadDoc, ROOT};
-        let mut doc1 = Automerge::new();
-        let (cards, card1) = doc1
-            .transact_with::<_, _, automerge::AutomergeError, _>(
-                |_| CommitOptions::default().with_message("Add card".to_owned()),
-                |tx| {
-                    let cards = tx.put_object(ROOT, "cards", ObjType::List).unwrap();
-                    let card1 = tx.insert_object(&cards, 0, ObjType::Map)?;
-                    tx.put(&card1, "title", "Rewrite everything in Clojure")?;
-                    tx.put(&card1, "done", false)?;
-                    let card2 = tx.insert_object(&cards, 0, ObjType::Map)?;
-                    tx.put(&card2, "title", "Rewrite everything in Haskell")?;
-                    tx.put(&card2, "done", false)?;
-                    Ok((cards, card1))
-                },
-            )
-            .unwrap()
-            .result;
-
-        let mut doc2 = Automerge::new();
-        doc2.merge(&mut doc1).unwrap();
-
-        let binary = doc1.save();
-        let mut doc2 = Automerge::load(&binary).unwrap();
-
-        doc1.transact_with::<_, _, AutomergeError, _>(
-            |_| CommitOptions::default().with_message("Mark card as done".to_owned()),
-            |tx| {
-                tx.put(&card1, "done", true)?;
-                Ok(())
-            },
-        )
-        .unwrap();
-
-        doc2.transact_with::<_, _, AutomergeError, _>(
-            |_| CommitOptions::default().with_message("Delete card".to_owned()),
-            |tx| {
-                tx.delete(&cards, 0)?;
-                Ok(())
-            },
-        )
-        .unwrap();
-
-        doc1.merge(&mut doc2).unwrap();
-
-        for change in doc1.get_changes(&[]).unwrap() {
-            let length = doc1.length_at(&cards, &[change.hash()]);
-            println!("{} {}", change.message().unwrap(), length);
-        }
-    }
-}
-
-pub(crate) mod exp {
-
-    use std::sync::{Arc, Mutex, RwLock};
-
-    #[cfg(target_arch = "wasm32")]
-    use async_executors::JoinHandle;
-    use automerge::ActorId;
-    use autosurgeon::{hydrate, reconcile, Hydrate, Reconcile, Text};
-    use egui_addon::code_editor::generic_text_buffer::TextBuffer;
-    use futures_util::{Future, SinkExt, StreamExt};
-    #[cfg(not(target_arch = "wasm32"))]
-    use tokio::task::JoinHandle;
-
-    #[derive(Default, Debug, Reconcile, Hydrate)]
-    pub(crate) struct Quot {
-        pub(crate) text: Text,
-    }
-
-    impl<'de> serde::Deserialize<'de> for Quot {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: serde::Deserializer<'de>,
-        {
-            use de::Unexpected;
-            use serde::de;
-            use std::fmt;
-            struct V;
-            impl<'de> serde::de::Visitor<'de> for V {
-                type Value = String;
-
-                fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                    write!(formatter, "a string containing at least {} bytes", 0)
-                }
-
-                fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
-                where
-                    E: de::Error,
-                {
-                    if s.len() >= 0 {
-                        Ok(s.to_owned())
-                    } else {
-                        Err(de::Error::invalid_value(Unexpected::Str(s), &self))
-                    }
-                }
-            }
-            deserializer.deserialize_string(V).map(|x| Quot {
-                text: Text::with_value(x),
-            })
-        }
-    }
-
-    impl serde::Serialize for Quot {
-        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: serde::Serializer,
-        {
-            serializer.collect_str(self.text.as_str())
-        }
-    }
-
-    // TODO take inspiration from Text tom impl From
-    impl From<String> for Quot {
-        fn from(value: String) -> Self {
-            Quot { text: value.into() }
-        }
-    }
-    impl From<&str> for Quot {
-        fn from(value: &str) -> Self {
-            Quot { text: value.into() }
-        }
-    }
-
-    impl egui_addon::code_editor::generic_text_buffer::AsText for Quot {
-        fn text(&self) -> &str {
-            self.text.as_str()
-        }
-    }
-
-    impl TextBuffer for Quot {
-        type Ref = Quot;
-
-        fn is_mutable(&self) -> bool {
-            true
-        }
-
-        fn as_reference(&self) -> &Self::Ref {
-            self
-        }
-
-        fn insert_text(&mut self, text: &str, char_index: usize) -> usize {
-            let l = text.len();
-            self.text.splice(char_index, 0, text);
-            l
-        }
-
-        fn delete_char_range(&mut self, char_range: std::ops::Range<usize>) {
-            self.text
-                .splice(char_range.start, char_range.end - char_range.start, "");
-        }
-    }
-
-    pub(crate) type Quote = Arc<Mutex<Quot>>;
-
-    pub(super) struct WsCont(tokio_tungstenite_wasm::WebSocketStream);
-    unsafe impl Send for WsCont {}
-
-    pub(super) struct WsDoc {
-        ws: WsState,
-        pub doc: Arc<RwLock<(automerge::AutoCommit, automerge::sync::State)>>,
-        pub timer: f32,
-    }
-
-    #[derive(Default)]
-    enum WsState {
-        Init(poll_promise::Promise<tokio_tungstenite_wasm::Result<WsCont>>),
-        Error(tokio_tungstenite_wasm::Error),
-        Setup(
-            // futures_util::stream::SplitSink<
-            //     tokio_tungstenite_wasm::WebSocketStream,
-            //     tokio_tungstenite_wasm::Message,
-            // >,
-            futures::channel::mpsc::Sender<tokio_tungstenite_wasm::Message>,
-            H,
-        ),
-        #[default]
-        Empty,
-    }
-
-    impl WsDoc {
-        pub(super) fn new(rt: &Rt, who: usize, ctx: egui::Context) -> Self {
-            let (s, p) = poll_promise::Promise::new();
-            rt.spawn(async move {
-                s.send(WsDoc::make_ws_async(who).await);
-                ctx.request_repaint();
-            });
-            WsDoc {
-                ws: WsState::Init(p),
-                doc: Arc::new(RwLock::new((
-                    automerge::AutoCommit::new(),
-                    automerge::sync::State::new(),
-                ))),
-                timer: 0.0,
-            }
-        }
-        async fn make_ws_async(who: usize) -> tokio_tungstenite_wasm::Result<WsCont> {
-            let url = format!("ws://{}/ws", &API_URL[7..]);
-            wasm_rs_dbg::dbg!(&url);
-            match tokio_tungstenite_wasm::connect(url).await {
-                Ok(stream) => {
-                    wasm_rs_dbg::dbg!("Handshake for client {} has been completed", who);
-                    Ok(WsCont(stream))
-                }
-                Err(e) => {
-                    wasm_rs_dbg::dbg!("WebSocket handshake for client {who} failed with {e}!");
-                    Err(e)
-                }
-            }
-        }
-        pub(super) fn setup_atempt<F>(&mut self, receiver_f: F, rt: &Rt) -> Result<(), String>
-        where
-            F: FnOnce(
-                futures::channel::mpsc::Sender<tokio_tungstenite_wasm::Message>,
-                futures_util::stream::SplitStream<tokio_tungstenite_wasm::WebSocketStream>,
-            ) -> H,
-        {
-            // NOTE could replace Empty variant by the following default value
-            // tokio_tungstenite_wasm::Error::from(http::status::StatusCode::from_u16(42).unwrap_err());
-            match std::mem::take(&mut self.ws) {
-                WsState::Init(prom) => {
-                    match prom.try_take() {
-                        Ok(Ok(ws)) => {
-                            let (mut sender, receiver) = ws.0.split();
-                            let (s, mut r) = futures::channel::mpsc::channel(50);
-                            rt.spawn(async move {
-                                wasm_rs_dbg::dbg!();
-                                while let Some(x) = r.next().await {
-                                    wasm_rs_dbg::dbg!();
-                                    sender.send(x).await.expect("Can not send!");
-                                }
-                            });
-                            self.ws = WsState::Setup(s.clone(), receiver_f(s, receiver))
-                        }
-                        Ok(Err(err)) => {
-                            let error = err.to_string();
-                            self.ws = WsState::Error(err);
-                            return Err(error);
-                        }
-                        Err(prom) => self.ws = WsState::Init(prom),
-                    };
-                    Ok(())
-                }
-                WsState::Error(err) => {
-                    let error = err.to_string();
-                    self.ws = WsState::Error(err);
-                    Err(error)
-                }
-                WsState::Setup(s, r) => {
-                    self.ws = WsState::Setup(s, r);
-                    Ok(())
-                }
-                WsState::Empty => panic!("unrecoverable state"),
-            }
-        }
-
-        pub(crate) fn changed(&mut self, rt: &Rt, quote: &mut impl Reconcile) {
-            wasm_rs_dbg::dbg!();
-            let (doc, sync_state): &mut (_, _) = &mut self.doc.write().unwrap();
-            // let heads = doc.get_heads();
-            if let Err(e) = reconcile(doc, &*quote) {
-                wasm_rs_dbg::dbg!(e);
-            };
-            match &mut self.ws {
-                WsState::Init(_) => (),
-                WsState::Error(_) => (),
-                WsState::Setup(sender, _) => {
-                    use automerge::sync::SyncDoc;
-                    if let Some(x) = doc.sync().generate_sync_message(sync_state) {
-                        let x = tokio_tungstenite_wasm::Message::Binary(x.encode().to_vec());
-                        let mut sender = sender.clone();
-                        rt.spawn(async move {
-                            sender.send(x).await.unwrap();
-                        });
-                    } else {
-                        wasm_rs_dbg::dbg!();
-                    }
-                    // let changes = doc
-                    //     .get_changes(&heads)
-                    //     .unwrap()
-                    //     .into_iter()
-                    //     .map(|x| tokio_tungstenite_wasm::Message::Binary(x.raw_bytes().to_vec()))
-                    //     .collect::<Vec<_>>();
-                    // doc.commit();
-                    // wasm_rs_dbg::dbg!(&changes);
-                    // let mut sender = sender.clone();
-                    // rt.spawn(async move {
-                    //     for x in changes {
-                    //         sender.send(x).await.unwrap();
-                    //     }
-                    // });
-                }
-                WsState::Empty => panic!(),
-            };
-        }
-
-        pub(crate) fn sender(
-            &mut self,
-        ) -> Option<futures::channel::mpsc::Sender<tokio_tungstenite_wasm::Message>> {
-            match &mut self.ws {
-                WsState::Init(_) => None,
-                WsState::Error(_) => None,
-                WsState::Setup(sender, _) => Some(sender.clone()),
-                WsState::Empty => panic!(),
-            }
-        }
-    }
-
-    pub(super) struct WsIntern(
-        Arc<
-            Mutex<
-                futures_util::stream::SplitSink<
-                    tokio_tungstenite_wasm::WebSocketStream,
-                    tokio_tungstenite_wasm::Message,
-                >,
-            >,
-        >,
-        H, // futures_util::stream::SplitStream<tokio_tungstenite_wasm::WebSocketStream>,
-        Quote,
-    );
-    unsafe impl Send for WsIntern {}
-    impl WsIntern {
-        fn do_stuff(&self, rt: &Rt) {
-            // let mutex = self.0.clone();
-            // let mut sender = mutex.try_lock().unwrap();
-            // let sent = sender
-            //         .send(tokio_tungstenite_wasm::Message::Text(
-            //             "Hello, Server!".into(),
-            //         ));
-            // rt.spawn(async move {
-            //         sent.await
-            //         .expect("Can not send!");
-            // });
-        }
-    }
-
-    pub(super) type Ws = poll_promise::Promise<tokio_tungstenite_wasm::Result<WsIntern>>;
-
-    #[derive(Clone)]
-    pub(super) struct Rt(
-        #[cfg(not(target_arch = "wasm32"))] pub(super) Arc<tokio::runtime::Runtime>,
-    );
-
-    impl Default for Rt {
-        fn default() -> Self {
-            Self(
-                #[cfg(not(target_arch = "wasm32"))]
-                Arc::new(
-                    tokio::runtime::Builder::new_multi_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap(),
-                ),
-            )
-        }
-    }
-
-    pub(super) struct H(#[cfg(not(target_arch = "wasm32"))] JoinHandle<()>);
-
-    impl Rt {
-        #[cfg(not(target_arch = "wasm32"))]
-        pub(super) fn spawn<F>(&self, future: F) -> H
-        where
-            F: Future<Output = ()> + Send + 'static,
-        {
-            H(self.0.spawn(future))
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        pub(super) fn spawn<F>(&self, future: F) -> H
-        where
-            F: Future<Output = ()> + 'static,
-        {
-            wasm_bindgen_futures::spawn_local(future);
-            H()
-        }
-    }
-    pub(super) fn make_ws(rt: &Rt, who: usize, quote: &Quote, ctx: egui::Context) -> Ws {
-        let (s, p) = poll_promise::Promise::new();
-        let rt0 = rt.clone();
-        let quote = quote.clone();
-        rt.spawn(async move {
-            s.send(make_ws_async(&rt0, who, quote, ctx.clone()).await);
-            ctx.request_repaint();
-        });
-        p
-    }
-    pub(super) async fn make_ws_async(
-        rt: &Rt,
-        who: usize,
-        quote: Quote,
-        ctx: egui::Context,
-    ) -> tokio_tungstenite_wasm::Result<WsIntern> {
-        let url = format!("ws://{}/ws", &API_URL[7..]);
-        wasm_rs_dbg::dbg!(&url);
-        match tokio_tungstenite_wasm::connect(url).await {
-            Ok(stream) => {
-                //(stream, response)) => {
-                wasm_rs_dbg::dbg!("Handshake for client {} has been completed", who);
-                // This will be the HTTP response, same as with server this is the last moment we
-                // can still access HTTP stuff.
-                // println!("Server response was {:?}", response);
-                // let aaa = stream.next().await;
-                // dbg!(aaa);
-                let (sink, mut receiver) = stream.split();
-                // let receiver = Arc::new(Mutex::new(receiver));
-
-                let recv_task = rt.spawn(async move {
-                    while let Some(Ok(msg)) = receiver.next().await {
-                        let text = &mut quote.lock().unwrap().text;
-                        text.splice(text.as_str().len(), 0, msg.to_string());
-                        ctx.request_repaint();
-                        // print message and break if instructed to do so
-                        if process_message(msg, who).is_break() {
-                            break;
-                        }
-                    }
-                });
-                let sink = Arc::new(Mutex::new(sink));
-                Ok(WsIntern(sink, recv_task, Default::default()))
-            }
-            Err(e) => {
-                wasm_rs_dbg::dbg!("WebSocket handshake for client {who} failed with {e}!");
-                Err(e)
-            }
-        }
-    }
-
-    /// Function to handle messages we get (with a slight twist that Frame variant is visible
-    /// since we are working with the underlying tungstenite library directly without axum here).
-    fn process_message(
-        msg: tokio_tungstenite_wasm::Message,
-        who: usize,
-    ) -> std::ops::ControlFlow<(), ()> {
-        match msg {
-            tokio_tungstenite_wasm::Message::Text(t) => {
-                wasm_rs_dbg::dbg!(format!(">>> {} got str: {:?}", who, t));
-            }
-            tokio_tungstenite_wasm::Message::Binary(d) => {
-                wasm_rs_dbg::dbg!(format!(">>> {} got {} bytes: {:?}", who, d.len(), d));
-            }
-            tokio_tungstenite_wasm::Message::Close(c) => {
-                if let Some(cf) = c {
-                    wasm_rs_dbg::dbg!(format!(
-                        ">>> {} got close with code {} and reason `{}`",
-                        who, cf.code, cf.reason
-                    ));
-                } else {
-                    wasm_rs_dbg::dbg!(format!(
-                        ">>> {} somehow got close message without CloseFrame",
-                        who
-                    ));
-                }
-                return std::ops::ControlFlow::Break(());
-            } // Message::Pong(v) => {
-              //     println!(">>> {} got pong with {:?}", who, v);
-              // }
-              // // Just as with axum server, the underlying tungstenite websocket library
-              // // will handle Ping for you automagically by replying with Pong and copying the
-              // // v according to spec. But if you need the contents of the pings you can see them here.
-              // Message::Ping(v) => {
-              //     println!(">>> {} got ping with {:?}", who, v);
-              // }
-
-              // Message::Frame(_) => {
-              //     unreachable!("This is never supposed to happen")
-              // }
-        }
-        std::ops::ControlFlow::Continue(())
-    }
-
-    use crate::app::API_URL;
-
-    // #[cfg(not(target_arch = "wasm32"))]
-    // pub(super) fn spawn<F>(rt: &Rt, future: F) -> JoinHandle<F::Output>
-    // where
-    //     F: Future + Send + 'static,
-    //     F::Output: Send + 'static,
-    // {
-    //     rt.0.spawn(future)
-    // }
-
-    // #[cfg(target_arch = "wasm32")]
-    // pub(super) fn spawn<F>(rt: &Rt, future: F) -> JoinHandle<F::Output>
-    // where
-    //     F: Future + Send + 'static,
-    //     F::Output: Send + 'static,
-    // {
-    //     wasm_bindgen_futures::spawn_local(future);
-    // }
-
-    // #[cfg(not(target_arch = "wasm32"))]
-    // pub(super) fn sync_stuff(rt: &Rt) {
-    //     spawn(rt, async move {
-    //         // spawn_client(42).await;
-    //     });
-    // }
-
-    // #[cfg(target_arch = "wasm32")]
-    // pub(super) fn sync_stuff(rt: &Rt) {
-    //     wasm_rs_dbg::dbg!();
-    //     spawn(rt, async move {
-    //         // spawn_client(rt, 42).await;
-    //     });
-    //     // poll_promise::Promise::spawn_async(async move {
-    //     //     spawn_client(42).await;
-    //     // }).block_until_ready();
-    // }
-}
-
-mod exp_ws {
-    // use tokio_tungstenite::{connect_async, tungstenite::Message};
-
-    use std::{borrow::Cow, ops::ControlFlow};
-
-    use async_executors::{LocalSpawnHandle, LocalSpawnHandleExt, SpawnHandle, SpawnHandleExt};
-    use egui_addon::async_exec::spawn_macrotask;
-    use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite_wasm::Message;
-
-    use crate::app::API_URL;
-
-    //creates a client. quietly exits on failure.
-    pub(crate) async fn spawn_client(who: usize) {
-        //, exec: impl LocalSpawnHandle<()>
-        let (mut sender, mut receiver) = match make_ws(who).await {
-            Some(value) => value,
-            None => return,
-        };
-
-        //we can ping the server for start
-        sender
-            .send(Message::Text("Hello, Server!".into()))
-            .await
-            .expect("Can not send!");
-
-        // //spawn an async sender to push some more messages into the server
-        // let mut send_task = exec.spawn_handle_local(async move {
-        //     for i in 1..30 {
-        //         // In any websocket error, break loop.
-        //         if sender
-        //             .send(Message::Text(format!("Message number {}...", i)))
-        //             .await
-        //             .is_err()
-        //         {
-        //             //just as with server, if send fails there is nothing we can do but exit.
-        //             return;
-        //         }
-
-        //         // tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        //     }
-
-        //     // When we are done we may want our client to close connection cleanly.
-        //     println!("Sending close to {}...", who);
-        //     // if let Err(e) = sender
-        //     //     .send(Message::Close(Some(CloseFrame {
-        //     //         code: tokio_tungstenite_wasm::coding::CloseCode::Normal,
-        //     //         reason: Cow::from("Goodbye"),
-        //     //     })))
-        //     //     .await
-        //     // {
-        //     //     println!("Could not send Close due to {:?}, probably it is ok?", e);
-        //     // };
-        // }).unwrap();
-
-        while let Some(Ok(msg)) = receiver.next().await {
-            // print message and break if instructed to do so
-            if process_message(msg, who).is_break() {
-                break;
-            }
-        }
-
-        // //receiver just prints whatever it gets
-        // let mut recv_task = exec.spawn_handle_local(async move {
-        //     while let Some(Ok(msg)) = receiver.next().await {
-        //         // print message and break if instructed to do so
-        //         if process_message(msg, who).is_break() {
-        //             break;
-        //         }
-        //     }
-        // }).unwrap();
-
-        // // //wait for either task to finish and kill the other task
-        // // tokio::select! {
-        // //     _ = (&mut send_task) => {
-        // //         recv_task.abort();
-        // //     },
-        // //     _ = (&mut recv_task) => {
-        // //         send_task.abort();
-        // //     }
-        // // }
-        // exec.spawn_handle_local(async move {
-        //     recv_task.await
-        // }).unwrap();
-    }
-
-    async fn make_ws(
-        who: usize,
-    ) -> Option<(
-        futures_util::stream::SplitSink<tokio_tungstenite_wasm::WebSocketStream, Message>,
-        futures_util::stream::SplitStream<tokio_tungstenite_wasm::WebSocketStream>,
-    )> {
-        let url = format!("ws://{}/ws", &API_URL[7..]);
-        wasm_rs_dbg::dbg!(&url);
-        let ws_stream = match tokio_tungstenite_wasm::connect(url).await {
-            Ok(mut stream) => {
-                //(stream, response)) => {
-                wasm_rs_dbg::dbg!("Handshake for client {} has been completed", who);
-                // This will be the HTTP response, same as with server this is the last moment we
-                // can still access HTTP stuff.
-                // println!("Server response was {:?}", response);
-                let aaa = stream.next().await;
-                dbg!(aaa);
-                stream
-            }
-            Err(e) => {
-                wasm_rs_dbg::dbg!("WebSocket handshake for client {who} failed with {e}!");
-                return None;
-            }
-        };
-        let (mut sender, mut receiver) = ws_stream.split();
-        Some((sender, receiver))
-    }
-
-    /// Function to handle messages we get (with a slight twist that Frame variant is visible
-    /// since we are working with the underlying tungstenite library directly without axum here).
-    fn process_message(msg: Message, who: usize) -> ControlFlow<(), ()> {
-        match msg {
-            Message::Text(t) => {
-                wasm_rs_dbg::dbg!(format!(">>> {} got str: {:?}", who, t));
-            }
-            Message::Binary(d) => {
-                wasm_rs_dbg::dbg!(format!(">>> {} got {} bytes: {:?}", who, d.len(), d));
-            }
-            Message::Close(c) => {
-                if let Some(cf) = c {
-                    wasm_rs_dbg::dbg!(format!(
-                        ">>> {} got close with code {} and reason `{}`",
-                        who, cf.code, cf.reason
-                    ));
-                } else {
-                    wasm_rs_dbg::dbg!(format!(
-                        ">>> {} somehow got close message without CloseFrame",
-                        who
-                    ));
-                }
-                return ControlFlow::Break(());
-            } // Message::Pong(v) => {
-              //     println!(">>> {} got pong with {:?}", who, v);
-              // }
-              // // Just as with axum server, the underlying tungstenite websocket library
-              // // will handle Ping for you automagically by replying with Pong and copying the
-              // // v according to spec. But if you need the contents of the pings you can see them here.
-              // Message::Ping(v) => {
-              //     println!(">>> {} got ping with {:?}", who, v);
-              // }
-
-              // Message::Frame(_) => {
-              //     unreachable!("This is never supposed to happen")
-              // }
-        }
-        ControlFlow::Continue(())
-    }
-
-    use crate::app::ComputeConfigSingle;
-
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(super) fn do_stuff(single: &ComputeConfigSingle) {
-        wasm_rs_dbg::dbg!();
-        // poll_promise::Promise::spawn_async(async move {
-        //     spawn_client(42).await;
-        // }).block_until_ready();
-        single.rt.0.spawn(async move {
-            spawn_client(42).await;
-        });
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    pub(super) fn do_stuff(single: &ComputeConfigSingle) {
-        wasm_rs_dbg::dbg!();
-        wasm_bindgen_futures::spawn_local(async move {
-            spawn_client(42).await;
-        });
-        // poll_promise::Promise::spawn_async(async move {
-        //     spawn_client(42).await;
-        // }).block_until_ready();
     }
 }
 

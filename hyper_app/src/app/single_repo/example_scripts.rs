@@ -1,5 +1,6 @@
 #[derive(Clone)]
 pub(super) struct Scripts {
+    pub(crate) description: &'static str,
     pub(crate) init: &'static str,
     pub(crate) filter: &'static str,
     pub(crate) accumulate: &'static str,
@@ -19,8 +20,9 @@ pub(crate) enum Forge {
     GitLab,
 }
 
-#[derive(Clone)]
+#[derive(serde::Deserialize, serde::Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Config {
+    Any,
     MavenJava,
     MakeCpp,
 }
@@ -54,7 +56,6 @@ impl From<&Commit> for super::super::types::Commit {
     }
 }
 
-
 pub(super) const EXAMPLES: &[Example] = &[
     Example {
         name: "default example (Java)",
@@ -69,6 +70,8 @@ pub(super) const EXAMPLES: &[Example] = &[
         config: Config::MavenJava,
         commits: 1,
         scripts: Scripts {
+            description: r#"Simply computes the number of files and type declarations (classes, interface, enums)
+Made to work on Java source code."#,
             init: r##"#{ depth:0, files: 0, type_decl: 0 }"##,
             filter: r##"if is_directory() {
     children().map(|x| [x, #{
@@ -108,6 +111,8 @@ pub(super) const EXAMPLES: &[Example] = &[
         config: Config::MakeCpp,
         commits: 1,
         scripts: Scripts {
+            description: r#"Simply computes the number of files and type declarations (classes ans structs).
+Made to work on Cpp source code."#,
             init: r##"#{ depth:0, files: 0, type_decl: 0 }"##,
             filter: r##"if is_directory() {
     children().map(|x| [x, #{
@@ -160,6 +165,10 @@ pub(super) const EXAMPLES: &[Example] = &[
         config: Config::MakeCpp,
         commits: 10,
         scripts: Scripts {
+            description: r#"Naively computes the number of files and ast elements.
+This particular implementation goes all the way down in the ast,
+thus most likely, compute time will scale with the number of nodes to traverse :/.
+Works on Stockfish, hangs on the Linux kernel."#,
             init: r##"#{ depth:0, files: 0, size: 0 }"##,
             filter: r##"if is_directory() {
     children().map(|x| [x, #{
@@ -202,6 +211,10 @@ pub(super) const EXAMPLES: &[Example] = &[
         config: Config::MakeCpp,
         commits: 10,
         scripts: Scripts {
+            description: r#"Smartly computes the number of files and ast elements.
+Compared to the naive implementation, here it stops just after files,
+making a much smaller, thus faster traversal :).
+Works on Stockfish AND on the Linux kernel. Yay"#,
             init: r##"#{ depth:0, files: 0, size: 0 }"##,
             filter: r##"if is_directory() {
     children().map(|x| [x, #{
@@ -238,6 +251,7 @@ pub(super) const EXAMPLES: &[Example] = &[
         config: Config::MavenJava,
         commits: 1,
         scripts: Scripts {
+            description: "Same naive approach but on Java projects, here Spoon.",
             init: r##"#{ depth:0, files: 0, size: 0 }"##,
             filter: r##"if is_directory() {
     children().map(|x| [x, #{
@@ -280,6 +294,7 @@ pub(super) const EXAMPLES: &[Example] = &[
         config: Config::MavenJava,
         commits: 10,
         scripts: Scripts {
+            description: "Same smart approach but on Java projects, here Spoon.",
             init: r##"#{ depth:0, files: 0, size: 0 }"##,
             filter: r##"if is_directory() {
     children().map(|x| [x, #{
@@ -295,6 +310,43 @@ pub(super) const EXAMPLES: &[Example] = &[
             accumulate: r##"if is_directory() {
     p.files += s.files;
     p.size += s.size + 1;
+} else if is_file() {
+    p.files += 1;
+    p.size += size();
+} else { // will not reach
+    p.size += size(); 
+}"##,
+        },
+    },
+    Example {
+        name: "size per file on Spoon",
+        commit: Commit {
+            repo: Repo {
+                forge: Forge::GitHub,
+                user: "INRIA",
+                name: "spoon",
+            },
+            id: "56e12a0c0e0e69ea70863011b4f4ca3305e0542b",
+        },
+        config: Config::MavenJava,
+        commits: 1,
+        scripts: Scripts {
+            description: "Same smart approach but on Java projects, here Spoon.",
+            init: r##"#{ depth:0, files: 0, size: [] }"##,
+            filter: r##"if is_directory() {
+    children().map(|x| [x, #{
+        depth: s.depth + 1,
+        files: s.files,
+        size: s.size,
+    }])
+} else if is_file() {
+    []
+} else { // will not reach
+    []
+}"##,
+            accumulate: r##"if is_directory() {
+    p.files += s.files;
+    p.size += s.size;
 } else if is_file() {
     p.files += 1;
     p.size += size();

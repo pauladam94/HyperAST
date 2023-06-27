@@ -4,16 +4,19 @@ use eframe::epaint::ahash::HashMap;
 use egui::{Response, WidgetText};
 use egui_demo_lib::easy_mark::easy_mark;
 use serde::Deserialize;
-use std::sync::Arc;
+use std::{fmt::Debug, sync::Arc};
 
 const TREE_SITTER: bool = false;
 
 pub(crate) mod editor_content;
 
+mod generic_state;
 pub mod generic_text_buffer;
 pub mod generic_text_edit;
-mod generic_state;
 
+pub trait CodeHolder {
+    fn set_lang(&mut self, lang: String);
+}
 
 #[derive(serde::Deserialize, serde::Serialize)]
 pub struct CodeEditor<C = EditAwareString> {
@@ -31,7 +34,45 @@ pub struct CodeEditor<C = EditAwareString> {
     pub lang: Option<Lang>,
 }
 
-#[derive(Deserialize, serde::Serialize)]
+impl<C> CodeHolder for CodeEditor<C> {
+    fn set_lang(&mut self, lang: String) {
+        self.language = lang;
+    }
+}
+
+impl<C: Debug> Debug for CodeEditor<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodeEditor")
+            .field("code", &self.code)
+            .finish()
+    }
+}
+
+impl<C: Clone> Clone for CodeEditor<C> {
+    fn clone(&self) -> Self {
+        Self {
+            info: self.info.clone(),
+            language: self.language.clone(),
+            code: self.code.clone(),
+            lang: self.lang.clone(),
+            parser: default_parser(),
+            languages: self.languages.clone(),
+        }
+    }
+}
+
+impl<C: From<String>> From<(EditorInfo<String>, String)> for CodeEditor<C> {
+    fn from((info, code): (EditorInfo<String>, String)) -> Self {
+        let code = code.into();
+        Self {
+            info,
+            code,
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Deserialize, serde::Serialize, Clone)]
 pub struct EditorInfo<T> {
     pub title: T,
     pub short: T,

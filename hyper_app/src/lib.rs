@@ -3,6 +3,7 @@
 #![feature(entry_insert)]
 #![feature(extract_if)]
 #![feature(exclusive_wrapper)]
+#![feature(iter_intersperse)]
 
 mod app;
 pub use app::{types::Languages, HyperApp};
