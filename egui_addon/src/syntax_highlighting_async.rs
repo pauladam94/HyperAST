@@ -1,5 +1,5 @@
 use std::{
-    future::{IntoFuture},
+    future::IntoFuture,
     ops::Range,
     sync::{Arc, Mutex, RwLock},
 };
@@ -44,8 +44,14 @@ pub fn highlight0(ctx: &egui::Context, theme: &CodeTheme, code: &str, language: 
     })
 }
 
-/// Memoized Code highlighting
-pub fn highlight(ctx: &egui::Context, theme: &CodeTheme, code: &str, language: &str) -> LayoutJob {
+// /// Memoized Code highlighting
+// pub fn highlight(ctx: &egui::Context, theme: &CodeTheme, code: &str, language: &str) -> LayoutJob {
+pub fn highlight(
+    ctx: &egui::Context,
+    theme: &CodeTheme,
+    code: &impl TextBuffer,
+    language: &str,
+) -> LayoutJob {
     // async fn something_async() {
     //     wasm_rs_dbg::dbg!("aaa");
     // }
@@ -93,7 +99,11 @@ pub fn highlight(ctx: &egui::Context, theme: &CodeTheme, code: &str, language: &
     }
 
     impl cache::Spawner<(&CodeTheme, &str, &str), Incremental> for IncrementalSpawner {
-        fn spawn(&self, ctx: &egui::Context, (theme, code, lang): (&CodeTheme, &str, &str)) -> Incremental {
+        fn spawn(
+            &self,
+            ctx: &egui::Context,
+            (theme, code, lang): (&CodeTheme, &str, &str),
+        ) -> Incremental {
             Incremental {
                 mt: vec![],
                 h: Arc::new(self.0.incremental(ctx.clone(), theme, code, lang)),
@@ -105,7 +115,9 @@ pub fn highlight(ctx: &egui::Context, theme: &CodeTheme, code: &str, language: &
             }
         }
     }
-    impl cache::IncrementalComputer<IncrementalSpawner, (&CodeTheme, &str, &str), LayoutJob> for Incremental {
+    impl cache::IncrementalComputer<IncrementalSpawner, (&CodeTheme, &str, &str), LayoutJob>
+        for Incremental
+    {
         fn increment(&mut self, hh: &IncrementalSpawner, x: (&CodeTheme, &str, &str)) -> LayoutJob {
             if self.i < self.job.text.len() {
                 // self.0 = Some(increment(&self.h, &hh.0, x));
@@ -178,17 +190,8 @@ pub fn highlight(ctx: &egui::Context, theme: &CodeTheme, code: &str, language: &
 
         let mut hh = hh.clone();
         let mut that = this.clone();
-
-        // async fn something_async() {
-        //     wasm_rs_dbg::dbg!("aaa");
-        // }
         let future = move || {
-            // let mut t = that.write().unwrap();
-
-            // t.async_aux(hh.as_ref(), &highlighter).await
             IncrementalHighlightLayout2::highlight_n(this.clone(), hh.clone(), theme, n)
-            // .into_future()
-            // .await
         };
         async_exec::spawn_macrotask(Box::new(future))
     }
@@ -690,11 +693,17 @@ impl IncrementalHighlightLayout2 {
             // let mut t = that.write().unwrap();
 
             // t.async_aux(hh.as_ref(), &highlighter).await
-            IncrementalHighlightLayout2::highlight_n(this.clone(), hh.clone(), theme, (old_n * 2).min(500))
+            IncrementalHighlightLayout2::highlight_n(
+                this.clone(),
+                hh.clone(),
+                theme,
+                (old_n * 2).min(500),
+            )
             // .into_future()
             // .await
         };
-        aaa.ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        aaa.ctx
+            .request_repaint_after(std::time::Duration::from_millis(50));
         let value = async_exec::spawn_macrotask(Box::new(future));
         let a = aaa
             .inner
@@ -765,9 +774,9 @@ impl IncrementalHighlightLayout2 {
     }
 }
 
-use egui::text::{LayoutSection, TextFormat};
-use crate::syntax_highlighting_async::async_exec::TimeoutHandle;
 use super::syntect::CodeTheme;
+use crate::syntax_highlighting_async::async_exec::TimeoutHandle;
+use egui::text::{LayoutSection, TextFormat};
 
 fn convert_syntect_style(style: syntect::highlighting::Style) -> TextFormat {
     let fg = style.foreground;
